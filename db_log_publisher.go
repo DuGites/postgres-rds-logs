@@ -35,11 +35,8 @@ var (
 )
 
 func updateDbLogFile(dbname string, logfile string, marker string, hour string) {
-
 	key := map[string]*dynamodb.AttributeValue{
-		"db_name": {
-			S: aws.String(dbname),
-		},
+		"db_name": {S: aws.String(dbname)},
 	}
 
 	reqInput := &dynamodb.UpdateItemInput{
@@ -52,15 +49,9 @@ func updateDbLogFile(dbname string, logfile string, marker string, hour string) 
 			"#HR": aws.String("hour"),
 		},
 		ExpressionAttributeValues: map[string]*dynamodb.AttributeValue{
-			":l": {
-				S: aws.String(logfile),
-			},
-			":m": {
-				S: aws.String(marker),
-			},
-			":h": {
-				S: aws.String(hour),
-			},
+			":l": {S: aws.String(logfile)},
+			":m": {S: aws.String(marker)},
+			":h": {S: aws.String(hour)},
 		},
 		ReturnValues: aws.String("ALL_NEW"),
 	}
@@ -68,23 +59,11 @@ func updateDbLogFile(dbname string, logfile string, marker string, hour string) 
 	result, err := dySvc.UpdateItem(reqInput)
 	if err != nil {
 		if aerr, ok := err.(awserr.Error); ok {
-			switch aerr.Code() {
-			case dynamodb.ErrCodeConditionalCheckFailedException:
-				log.Println(dynamodb.ErrCodeConditionalCheckFailedException, aerr.Error())
-			case dynamodb.ErrCodeProvisionedThroughputExceededException:
-				log.Println(dynamodb.ErrCodeProvisionedThroughputExceededException, aerr.Error())
-			case dynamodb.ErrCodeResourceNotFoundException:
-				log.Println(dynamodb.ErrCodeResourceNotFoundException, aerr.Error())
-			case dynamodb.ErrCodeItemCollectionSizeLimitExceededException:
-				log.Println(dynamodb.ErrCodeItemCollectionSizeLimitExceededException, aerr.Error())
-			case dynamodb.ErrCodeInternalServerError:
-				log.Println(dynamodb.ErrCodeInternalServerError, aerr.Error())
-			default:
-				log.Println(aerr.Error())
-			}
+			log.Println(aerr.Code(), err) // Does the error string not include the error code? seems like this entire if else block might be the same as `log.Println(err)`
 		} else {
-			log.Println(err.Error())
+			log.Println(err) // Don't need to explicitly call err.Error() - it is assumed when you try to print an error
 		}
+		return
 	}
 	log.Println(result)
 }
@@ -94,7 +73,6 @@ func streamLogTextTOCloudWatch(lines string) {
 }
 
 func tailDatabaseLogFile(dbname string, logfile string, marker string, hour string) {
-
 	rdsClient := rds.New(awsSession)
 
 	dbInfo := &rds.DownloadDBLogFilePortionInput{
@@ -107,17 +85,11 @@ func tailDatabaseLogFile(dbname string, logfile string, marker string, hour stri
 	result, err := rdsClient.DownloadDBLogFilePortion(dbInfo)
 
 	if err != nil {
+		// Replace if else block with `log.Println(err)` ?
 		if aerr, ok := err.(awserr.Error); ok {
-			switch aerr.Code() {
-			case rds.ErrCodeDBInstanceNotFoundFault:
-				log.Println(rds.ErrCodeDBInstanceNotFoundFault, aerr.Error())
-			case rds.ErrCodeDBLogFileNotFoundFault:
-				log.Println(rds.ErrCodeDBLogFileNotFoundFault, aerr.Error())
-			default:
-				log.Println(aerr.Error())
-			}
+			log.Println(aerr.Code(), err)
 		} else {
-			log.Println(err.Error())
+			log.Println(err)
 		}
 		return
 	}
@@ -127,87 +99,82 @@ func tailDatabaseLogFile(dbname string, logfile string, marker string, hour stri
 	// File has been completely streamed
 	if !*result.AdditionalDataPending {
 		updateDbLogFile(dbname, logfile, "COMPLETED", hour)
-	} else {
-		// dbInfo.SetMarker(*result.Marker)
-		updateDbLogFile(dbname, logfile, *result.Marker, hour)
-		time.Sleep(2 * time.Second)
-
+		return
 	}
 
+	// dbInfo.SetMarker(*result.Marker)
+	updateDbLogFile(dbname, logfile, *result.Marker, hour)
+	time.Sleep(2 * time.Second) // What is this sleep for? This appears to be unnecessarily burning lambda time.
 }
 
 func loadPartiallyStreamedDBS() ([]map[string]*dynamodb.AttributeValue, error) {
-
 	req := &dynamodb.ScanInput{
 		TableName: aws.String("postgres_db_logs"),
 	}
-	result, scanerr := dySvc.Scan(req)
-	if scanerr != nil {
-		return make([]map[string]*dynamodb.AttributeValue, 0), scanerr
+	result, err := dySvc.Scan(req)
+	if err != nil {
+		return nil, err
 	}
 	return result.Items, nil
 }
 
 func main() {
-
 	startTime := time.Now()
 	loc, _ := time.LoadLocation("EST")
 	prevHourFile := time.Now().In(loc).Add(-1 * time.Hour).Format(nameFormat)
 	prevHour := time.Now().In(loc).Add(-1 * time.Hour)
 
-	pgFile := "error/postgresql.log.%s"
-	fileName := ""
+	pgFilePrefix := "error/postgresql.log."
 
 	// New DB's need to be added to the state table.
-	dbs, scanerr := loadPartiallyStreamedDBS()
-	if scanerr != nil {
-		log.Fatal("Dynamodb Scan Error: %s", scanerr)
+	dbs, err := loadPartiallyStreamedDBS()
+	if err != nil {
+		log.Fatalf("Dynamodb Scan Error: %s", err)
 	}
 
-	dblgs := []DBLog{}
-	unmrshlerr := dynamodbattribute.UnmarshalListOfMaps(dbs, &dblgs)
-	if unmrshlerr != nil {
-		unmrsherrstr := fmt.Errorf("%v", unmrshlerr)
-		log.Fatal(unmrsherrstr)
+	var dblgs []DBLog
+	err = dynamodbattribute.UnmarshalListOfMaps(dbs, &dblgs)
+	if err != nil {
+		log.Fatal(err)
 	}
 	if len(dblgs) == 0 {
 		log.Fatal("Configuration db has no databases loaded to capture logs.")
-	} else {
-		for _, db := range dblgs {
-			elapsed := time.Since(startTime)
-			if elapsed.Minutes() < 4.5 {
-
-				if db.DbLogfile == "NULL" {
-					// you can get all logs files that are present instead of previous hour
-					fileName = fmt.Sprintf(pgFile, prevHourFile)
-				} else {
-					fileName = db.DbLogfile
-				}
-				if db.Marker != "COMPLETED" {
-					log.Printf("Streaming %s File from Marker %s", fileName, db.Marker)
-					if db.Hour != "-1" {
-						tailDatabaseLogFile(db.DbName, fileName, db.Marker, db.Hour)
-					} else {
-						tailDatabaseLogFile(db.DbName, fileName, db.Marker, prevHour.Format(format))
-					}
-				} else {
-					timestamp, _ := time.Parse(format, db.Hour)
-					nextHour := timestamp.Add(1 * time.Hour)
-
-					if nextHour.Hour() < time.Now().In(loc).Hour() {
-						fileName = fmt.Sprintf(pgFile, timestamp.Add(1*time.Hour).Format(nameFormat))
-						tailDatabaseLogFile(db.DbName, fileName, "0", nextHour.Format(format))
-					} else {
-						log.Printf("Skipping log file error/postgresql.log.%v\n", time.Now().In(loc).Format(nameFormat))
-						log.Printf("%s log file has been completed\n", db.DbLogfile)
-					}
-
-				}
-			}
-
-		}
 	}
 
+	for _, db := range dblgs {
+		elapsed := time.Since(startTime)
+		if elapsed.Minutes() > 4.5 { // Go idiom to limit indentation when possible for the happy path, which means generally avoiding 'else' blocks if possible and checking for the 'unhappy' path with if statements
+			return
+		}
+
+		fileName := db.DbLogfile
+		if db.DbLogfile == "NULL" {
+			// you can get all logs files that are present instead of previous hour
+			fileName = pgFilePrefix + prevHourFile
+		}
+
+		if db.Marker == "COMPLETED" {
+			timestamp, _ := time.Parse(format, db.Hour)
+			nextHour := timestamp.Add(1 * time.Hour)
+
+			if nextHour.Hour() > time.Now().In(loc).Hour() {
+				log.Printf("Skipping log file error/postgresql.log.%v\n", time.Now().In(loc).Format(nameFormat))
+				log.Printf("%s log file has been completed\n", db.DbLogfile)
+				return
+			}
+
+			fileName = pgFilePrefix + nextHour.Format(nameFormat)
+			tailDatabaseLogFile(db.DbName, fileName, "0", nextHour.Format(format))
+			return
+		}
+
+		log.Printf("Streaming %s File from Marker %s", fileName, db.Marker)
+		if db.Hour != "-1" {
+			tailDatabaseLogFile(db.DbName, fileName, db.Marker, db.Hour)
+		} else {
+			tailDatabaseLogFile(db.DbName, fileName, db.Marker, prevHour.Format(format))
+		}
+	}
 }
 
 // func main() {
