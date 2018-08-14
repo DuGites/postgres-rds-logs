@@ -4,9 +4,11 @@ import (
 	"log"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/aws/aws-lambda-go/lambda"
+	// "github.com/aws/aws-lambda-go/lambda"
+
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/session"
@@ -55,7 +57,17 @@ type DBLog struct {
 	SeqToken  string `dynamodbav:"seq_token"`
 }
 
+//ProcessLogResponse ...
+type ProcessLogResponse struct {
+	status  string
+	dbName  string
+	lastLog string
+	err     error
+}
+
 var (
+	wg            sync.WaitGroup
+	mapLock       = sync.RWMutex{}
 	awsSession    = session.Must(session.NewSession(&aws.Config{Region: aws.String(region)}))
 	dySvc         = dynamodb.New(awsSession)
 	cloudWatchSvc = cloudwatchlogs.New(awsSession)
@@ -69,7 +81,7 @@ var (
 )
 
 // Updates the Dybamodb State table.
-func updateDbLogFile(dbName, logfile, marker, streamedTimeStamp string) {
+func updateDbLogFile(dbName string, logfile string, marker string, streamedTimeStamp string) {
 
 	key := map[string]*dynamodb.AttributeValue{
 		"db_name": {
@@ -98,9 +110,25 @@ func updateDbLogFile(dbName, logfile, marker, streamedTimeStamp string) {
 	res, err := dySvc.UpdateItem(reqInput)
 	if err != nil {
 		if aerr, ok := err.(awserr.Error); ok {
-			log.Println(aerr.Error())
+			switch aerr.Code() {
+			case dynamodb.ErrCodeConditionalCheckFailedException:
+				log.Println(dynamodb.ErrCodeConditionalCheckFailedException,
+					aerr.Error())
+			case dynamodb.ErrCodeProvisionedThroughputExceededException:
+				log.Println(dynamodb.ErrCodeProvisionedThroughputExceededException,
+					aerr.Error())
+			case dynamodb.ErrCodeResourceNotFoundException:
+				log.Println(dynamodb.ErrCodeResourceNotFoundException, aerr.Error())
+			case dynamodb.ErrCodeItemCollectionSizeLimitExceededException:
+				log.Println(dynamodb.ErrCodeItemCollectionSizeLimitExceededException,
+					aerr.Error())
+			case dynamodb.ErrCodeInternalServerError:
+				log.Println(dynamodb.ErrCodeInternalServerError, aerr.Error())
+			default:
+				log.Println(aerr.Error())
+			}
 		} else {
-			log.Println(err)
+			log.Println(err.Error())
 		}
 	}
 	log.Println("Streamed Postgres Error Log File", res)
@@ -131,16 +159,9 @@ func createLogGroupStream(logGroupName, streamName string) error {
 		log.Printf("LogGroup Creation failed %v", err)
 		return err
 	}
-CreateStream:
 	status, err := createStream(logGroupName, streamName)
 	if err != nil {
 		log.Printf("LogStream Creation failed %v", err)
-		if aerr, ok := err.(awserr.Error); ok && aerr.Code() == "ThrottlingException" {
-			// backoff
-			time.Sleep(2 * time.Second)
-			goto CreateStream
-		}
-
 		return err
 	}
 	if status == "STREAM_CREATED" {
@@ -153,14 +174,13 @@ CreateStream:
 	return nil
 }
 
-// Creates a CloudWatch LogGroup if it does not exist. If it exists returns nil
+// Creates a CloudWatch LogGroup if it does not exist. If it exists returns
 func createGroup(logGroupName string) error {
 
 	log.Println("Creating a LogGroup", logGroupName)
 	params := &cloudwatchlogs.CreateLogGroupInput{
 		LogGroupName: aws.String(logGroupName),
 	}
-LogGroup:
 	_, err := cloudWatchSvc.CreateLogGroup(params)
 	if err != nil {
 		if aerr, ok := err.(awserr.Error); ok {
@@ -168,9 +188,6 @@ LogGroup:
 			case cloudwatchlogs.ErrCodeResourceAlreadyExistsException:
 				log.Printf("LogGroup already exists %s", logGroupName)
 				return nil
-			case "ThrottlingException":
-				time.Sleep(2 * time.Second)
-				goto LogGroup
 			default:
 				return aerr
 			}
@@ -180,7 +197,7 @@ LogGroup:
 	return nil
 }
 
-// Creates a CloudWatch Stream if it does not exist. If it exists returns nil
+// Creates a CloudWatch Stream if it does not exist. If it exists returns
 func createStream(logGroupName, logStreamName string) (string, error) {
 
 	log.Printf("Creating a LogStream %s inside LogGroup %s", logStreamName, logGroupName)
@@ -188,7 +205,6 @@ func createStream(logGroupName, logStreamName string) (string, error) {
 		LogGroupName:  aws.String(logGroupName),
 		LogStreamName: aws.String(logStreamName),
 	}
-LogStream:
 	_, err := cloudWatchSvc.CreateLogStream(params)
 	if err != nil {
 		if aerr, ok := err.(awserr.Error); ok {
@@ -196,9 +212,6 @@ LogStream:
 			case cloudwatchlogs.ErrCodeResourceAlreadyExistsException:
 				log.Printf("LogStream already exists %s", logStreamName)
 				return "STREAM_EXISTS", nil
-			case "ThrottlingException":
-				time.Sleep(2 * time.Second)
-				goto LogStream
 			default:
 				return "ERROR", aerr
 			}
@@ -252,22 +265,19 @@ func streamLogTextToCloudWatch(dbName, logfile, seqToken string,
 		} else {
 			log.Println("Starting with an empty seq token", seqToken)
 		}
-	NextLogLine:
 		resp, err := cloudWatchSvc.PutLogEvents(cloudWatchEvents)
+
 		if err != nil {
 			log.Printf("The PutLogEvents failed with %v", err)
-			if aerr, ok := err.(awserr.Error); ok && aerr.Code() == "ThrottlingException" {
-				// backoff
-				time.Sleep(2 * time.Second)
-				goto NextLogLine
-			}
 			return err
 		}
 		log.Println("The PutLogEvents succeeded with next sequence token", *resp.NextSequenceToken)
 		if resp.RejectedLogEventsInfo != nil {
 			log.Printf("%s events were rejected", *resp.RejectedLogEventsInfo)
 		}
+		mapLock.Lock()
 		dbNextToken[dbName] = *resp.NextSequenceToken
+		mapLock.Unlock()
 		return nil
 	}
 	log.Printf("No data exists in %s or the file has been completely streamed", logfile)
@@ -288,7 +298,7 @@ func tailDatabaseLogFile(dbName, logfile, marker, hour string) error {
 		LogFileName:          aws.String(logfile), // FileName with yyyy-mm-dd appended.
 		Marker:               aws.String(marker),  // Starts at 0.
 	}
-Download:
+
 	res, err := rdsClient.DownloadDBLogFilePortion(dbInfo)
 	if err != nil {
 		if aerr, ok := err.(awserr.Error); ok {
@@ -298,9 +308,6 @@ Download:
 			case rds.ErrCodeDBLogFileNotFoundFault:
 				log.Println(rds.ErrCodeDBLogFileNotFoundFault, aerr.Error())
 				updateDbLogFile(dbName, logfile, "COMPLETED", hour)
-			case "ThrottlingException":
-				time.Sleep(2 * time.Second)
-				goto Download
 			default:
 				log.Println(aerr.Error())
 				return err
@@ -316,20 +323,18 @@ Download:
 		return nil
 	}
 	// Write the log lines to the cloudwatch log group
+	mapLock.RLock()
 	log.Printf("The sequence token for db %s is %s", dbName, dbNextToken[dbName])
-Streamer:
 	if nextToken, ok := dbNextToken[dbName]; ok {
 		err = streamLogTextToCloudWatch(dbName, logfile, nextToken, res)
+		time.Sleep(2 * time.Second)
 	} else {
 		err = streamLogTextToCloudWatch(dbName, logfile, "-1", res)
+		time.Sleep(2 * time.Second)
 	}
+	mapLock.RUnlock()
 	if err != nil {
 		log.Println("Streaming to CloudWatch Error", err)
-		if aerr, ok := err.(awserr.Error); ok && aerr.Code() == "ThrottlingException" {
-			// backoff
-			time.Sleep(2 * time.Second)
-			goto Streamer
-		}
 		return err
 	}
 
@@ -368,7 +373,6 @@ func loadPartiallyStreamedDBS() ([]map[string]*dynamodb.AttributeValue, error) {
 
 // Helper function to get a time instance from a string
 func getTimeFromString(dbHour string) time.Time {
-
 	t, err := time.Parse(logFileTS, dbHour)
 	if err == nil {
 		return t.UTC()
@@ -377,21 +381,25 @@ func getTimeFromString(dbHour string) time.Time {
 }
 
 // Processes all existing log files for a new database
-// or log files from the last time the job ran to the latest file.
-func processLogFiles(dbName, dbHour, dbMarker, dbLogFile string) (string, error) {
+// or log from the last time the job ran to the latest file.
+func processLogFiles(dbName, dbHour, dbMarker, dbLogFile string,
+	returnValues chan<- ProcessLogResponse) {
 
+	defer wg.Done()
 	finalFile := ""
-	input := &rds.DescribeDBLogFilesInput{
-		DBInstanceIdentifier: aws.String(dbName),
-		FilenameContains:     aws.String("error"),
-	}
+	input := &rds.DescribeDBLogFilesInput{}
 
 	// We process all existing error log files the first time
 	// Subsequent runs will process from the last file present in the state db
 	// NULL in the name  denotes a db that is added for the first time. If the hour is -1
 	// that means the Db has had no previous log files streamed and the name of the
 	// the file is NULL. We process all existing error logs files until the current hour.
-	if dbLogFile != "NULL" {
+	if dbLogFile == "NULL" {
+		input = &rds.DescribeDBLogFilesInput{
+			DBInstanceIdentifier: aws.String(dbName),
+			FilenameContains:     aws.String("error"),
+		}
+	} else {
 		fileWrittenSince, err := time.Parse(logFileTS, dbHour)
 		log.Printf("Get all files written since %v", fileWrittenSince)
 		if err != nil {
@@ -409,7 +417,8 @@ func processLogFiles(dbName, dbHour, dbMarker, dbLogFile string) (string, error)
 	log.Printf("%d log files exist since the last run", len(logFiles.DescribeDBLogFiles))
 	if err != nil {
 		log.Println(err.Error())
-		return "Failure", err
+		returnValues <- ProcessLogResponse{status: "Failure", err: err, dbName: dbName}
+		// return "Failure", err
 	}
 	// One case is when you start logging for the first time
 	// Another case is you run the logger again within the same hour -- the same file.
@@ -449,14 +458,16 @@ func processLogFiles(dbName, dbHour, dbMarker, dbLogFile string) (string, error)
 		}
 		if err != nil {
 			log.Println(err)
-			return "Failure", err
+			returnValues <- ProcessLogResponse{status: "", err: err, dbName: dbName, lastLog: *logg.LogFileName}
 		}
 		finalFile = *logg.LogFileName
 	}
-	return finalFile, nil
+	// return finalFile, nil
+	returnValues <- ProcessLogResponse{status: "Success", err: nil, dbName: dbName, lastLog: finalFile}
 }
 
-func startPostgresLogStreamer() error {
+// func startPostgresLogStreamer() (string, error) {
+func main() {
 
 	startTime := time.Now()
 	dblgs := []DBLog{}
@@ -464,12 +475,13 @@ func startPostgresLogStreamer() error {
 	dbs, err := loadPartiallyStreamedDBS()
 	if err != nil {
 		log.Println(err)
-		return err
+		// return "Fail", err
 	}
+	responseChan := make(chan ProcessLogResponse, len(dbs))
 	err = dynamodbattribute.UnmarshalListOfMaps(dbs, &dblgs)
 	if err != nil {
 		log.Println(err)
-		return err
+		// return "Fail", err
 	}
 	if len(dblgs) == 0 {
 		log.Fatal("Configuration db has no databases loaded to capture logs.")
@@ -479,21 +491,29 @@ func startPostgresLogStreamer() error {
 		log.Printf("\n############# Postgres DB %s #############\n", db.DbName)
 
 		elapsed := time.Since(startTime)
+		mapLock.Lock()
 		dbNextToken[db.DbName] = db.SeqToken
+		mapLock.Unlock()
 		log.Printf("The sequence token for db %s is %s", db.DbName, dbNextToken[db.DbName])
 		if elapsed.Minutes() > 4.5 {
 			os.Exit(0)
 		}
-		finalFile, err := processLogFiles(db.DbName, db.Hour, db.Marker, db.DbLogfile)
-		if err != nil {
-			log.Println(err)
-			return err
-		}
-		log.Printf("The last file processed for db %s in this run is %s", db.DbName, finalFile)
+		wg.Add(1)
+		go processLogFiles(db.DbName, db.Hour, db.Marker, db.DbLogfile, responseChan)
 	}
-	return nil
+	wg.Wait()
+	close(responseChan)
+	for resp := range responseChan {
+		if resp.err != nil {
+			log.Printf("DB %s unsuccessfully streamed with err %v", resp.dbName, resp.err)
+		} else {
+			log.Printf("DB %s successfully streamed with lastfile file %s", resp.dbName, resp.lastLog)
+		}
+	}
+
 }
 
-func main() {
-	lambda.Start(startPostgresLogStreamer)
-}
+// func main() {
+// Make the handler available for Remote Procedure Call by AWS Lambda
+// lambda.Start(startPostgresLogStreamer)
+// }
