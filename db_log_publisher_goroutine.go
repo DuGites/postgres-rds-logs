@@ -16,6 +16,7 @@ import (
 	"github.com/aws/aws-sdk-go/service/dynamodb"
 	"github.com/aws/aws-sdk-go/service/dynamodb/dynamodbattribute"
 	"github.com/aws/aws-sdk-go/service/rds"
+	"github.com/cenkalti/backoff"
 )
 
 /*
@@ -67,12 +68,12 @@ type ProcessLogResponse struct {
 
 var (
 	wg            sync.WaitGroup
-	mapLock       = sync.RWMutex{}
+	bckoff        = backoff.NewExponentialBackOff()
 	awsSession    = session.Must(session.NewSession(&aws.Config{Region: aws.String(region)}))
 	dySvc         = dynamodb.New(awsSession)
 	cloudWatchSvc = cloudwatchlogs.New(awsSession)
 	loc, _        = time.LoadLocation("UTC")
-	dbNextToken   = make(map[string]string)
+	dbNextToken   = sync.Map{}
 
 	stateTableName     = os.Getenv("STATE_TABLE")
 	subscriptionFilter = os.Getenv("FILTER")
@@ -88,6 +89,7 @@ func updateDbLogFile(dbName string, logfile string, marker string, streamedTimeS
 			S: aws.String(dbName),
 		},
 	}
+	token, _ := dbNextToken.Load(dbName)
 	reqInput := &dynamodb.UpdateItemInput{
 		TableName:        aws.String(stateTableName),
 		Key:              key,
@@ -102,7 +104,7 @@ func updateDbLogFile(dbName string, logfile string, marker string, streamedTimeS
 			":l": {S: aws.String(logfile)},
 			":m": {S: aws.String(marker)},
 			":h": {S: aws.String(streamedTimeStamp)},
-			":t": {S: aws.String(dbNextToken[dbName])},
+			":t": {S: aws.String(token.(string))},
 		},
 		ReturnValues: aws.String("ALL_NEW"),
 	}
@@ -154,9 +156,10 @@ func subscribeLogGroupToLambdaForwarder(logGroupName, lambdaArn string) error {
 // This method invoked Creation of a CW Group and Stream.
 func createLogGroupStream(logGroupName, streamName string) error {
 
-	err := createGroup(logGroupName)
+	bckoff.MaxElapsedTime = 1 * time.Minute
+	err := backoff.Retry(createGroup(logGroupName), bckoff)
 	if err != nil {
-		log.Printf("LogGroup Creation failed %v", err)
+		log.Printf("LogGroup Creation failed after retrying%v", err)
 		return err
 	}
 	status, err := createStream(logGroupName, streamName)
@@ -263,7 +266,7 @@ func streamLogTextToCloudWatch(dbName, logfile, seqToken string,
 				LogEvents:     logEvents,
 			}
 		} else {
-			log.Println("Starting with an empty seq token", seqToken)
+			log.Println("Starting with an initial seq token 'START'", seqToken)
 		}
 		resp, err := cloudWatchSvc.PutLogEvents(cloudWatchEvents)
 
@@ -275,9 +278,7 @@ func streamLogTextToCloudWatch(dbName, logfile, seqToken string,
 		if resp.RejectedLogEventsInfo != nil {
 			log.Printf("%s events were rejected", *resp.RejectedLogEventsInfo)
 		}
-		mapLock.Lock()
-		dbNextToken[dbName] = *resp.NextSequenceToken
-		mapLock.Unlock()
+		dbNextToken.Store(dbName, *resp.NextSequenceToken)
 		return nil
 	}
 	log.Printf("No data exists in %s or the file has been completely streamed", logfile)
@@ -323,16 +324,16 @@ func tailDatabaseLogFile(dbName, logfile, marker, hour string) error {
 		return nil
 	}
 	// Write the log lines to the cloudwatch log group
-	mapLock.RLock()
-	log.Printf("The sequence token for db %s is %s", dbName, dbNextToken[dbName])
-	if nextToken, ok := dbNextToken[dbName]; ok {
-		err = streamLogTextToCloudWatch(dbName, logfile, nextToken, res)
+	log.Printf("The sequence token for db %s is %s", dbName, dbNextToken.Load(dbName))
+	if nextToken, ok := dbNextToken.Load(dbName); ok {
+		// err = streamLogTextToCloudWatch(dbName, logfile, nextToken, res)
+		log.Println("Skipped Streaming the logs as we are testing")
 		time.Sleep(2 * time.Second)
 	} else {
-		err = streamLogTextToCloudWatch(dbName, logfile, "-1", res)
+		// err = streamLogTextToCloudWatch(dbName, logfile, initSeqToken, res)
+		log.Println("Skipped Streaming the logs as we are testing")
 		time.Sleep(2 * time.Second)
 	}
-	mapLock.RUnlock()
 	if err != nil {
 		log.Println("Streaming to CloudWatch Error", err)
 		return err
@@ -348,10 +349,12 @@ func tailDatabaseLogFile(dbName, logfile, marker, hour string) error {
 
 	// File has been completely streamed and more than 1 hour has passed.
 	if !*res.AdditionalDataPending && currentTime.Sub(dbHour) >= time.Hour {
-		updateDbLogFile(dbName, logfile, "COMPLETED", hour)
+		// updateDbLogFile(dbName, logfile, "COMPLETED", hour)
+		log.Println("Skipped Udpating the State Table as we are testing")
 		log.Printf("Completed Processing DBLog File %s for db %s", logfile, dbName)
 	} else if !*res.AdditionalDataPending && currentTime.Sub(dbHour) < time.Hour {
-		updateDbLogFile(dbName, logfile, *res.Marker, hour)
+		// updateDbLogFile(dbName, logfile, *res.Marker, hour)
+		log.Println("Skipped Udpating the State Table as we are testing")
 		log.Printf("Partially completed processing DBLog File %s for db %s", logfile, dbName)
 	}
 	return nil
@@ -491,10 +494,8 @@ func main() {
 		log.Printf("\n############# Postgres DB %s #############\n", db.DbName)
 
 		elapsed := time.Since(startTime)
-		mapLock.Lock()
-		dbNextToken[db.DbName] = db.SeqToken
-		mapLock.Unlock()
-		log.Printf("The sequence token for db %s is %s", db.DbName, dbNextToken[db.DbName])
+		dbNextToken.Store(db.DbName, db.SeqToken)
+		log.Printf("The sequence token for db %s is %s", db.DbName, db.SeqToken)
 		if elapsed.Minutes() > 4.5 {
 			os.Exit(0)
 		}

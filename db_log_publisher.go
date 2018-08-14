@@ -44,6 +44,8 @@ const (
 	pgFilePrefix       = "error/postgresql.log."
 	logGroupTemplate   = "/postgres/DB_NAME/error"
 	initSeqToken       = "START"
+	maxBytes           = 1048576
+	paddingByte        = 26
 )
 
 //DBLog ...
@@ -98,7 +100,7 @@ func updateDbLogFile(dbName, logfile, marker, streamedTimeStamp string) {
 	res, err := dySvc.UpdateItem(reqInput)
 	if err != nil {
 		if aerr, ok := err.(awserr.Error); ok {
-			log.Println(aerr.Error())
+			log.Println(aerr.Error(), err)
 		} else {
 			log.Println(err)
 		}
@@ -131,16 +133,9 @@ func createLogGroupStream(logGroupName, streamName string) error {
 		log.Printf("LogGroup Creation failed %v", err)
 		return err
 	}
-CreateStream:
 	status, err := createStream(logGroupName, streamName)
 	if err != nil {
 		log.Printf("LogStream Creation failed %v", err)
-		if aerr, ok := err.(awserr.Error); ok && aerr.Code() == "ThrottlingException" {
-			// backoff
-			time.Sleep(2 * time.Second)
-			goto CreateStream
-		}
-
 		return err
 	}
 	if status == "STREAM_CREATED" {
@@ -208,8 +203,41 @@ LogStream:
 	return "STREAM_CREATED", nil
 }
 
-// Forwards DBLogs to a CloudWatch Stream
-func streamLogTextToCloudWatch(dbName, logfile, seqToken string,
+// Chunks the db log file so that the streamer adheres to the AWS
+// PutlogEvents limit.
+func logLineChunker(lines []string) ([][]string, error) {
+
+	logStringEvents := make([][]string, 0)
+	chunk := make([]string, 0)
+	prev, current := 0, 0
+	lineBytes := []byte{}
+
+	log.Printf("Number of lines %d", len(lines))
+	for _, line := range lines {
+		lineBytes = []byte(line)
+		prev = current
+		current += paddingByte + len(lineBytes)
+
+		if current < maxBytes {
+			chunk = append(chunk, line)
+			continue
+		} else {
+			log.Printf("The current byteCounter %d is greater than maxBytes "+
+				"%d and bytes of last line %d", current, maxBytes, len(lineBytes))
+			logStringEvents = append(logStringEvents, chunk)
+			log.Printf("The number of chunks %d", len(logStringEvents))
+			log.Printf("Current Max:%d, %d, %d", maxBytes, current, prev)
+			current, prev = 0, 0
+			chunk = nil
+		}
+	}
+	logStringEvents = append(logStringEvents, chunk)
+	return logStringEvents, nil
+}
+
+// Forwards DBLogs to a CloudWatch Stream by chunking the file
+// if necessary.
+func streamLogTextToCloudWatch(dbName, logfile string,
 	output *rds.DownloadDBLogFilePortionOutput) error {
 
 	log.Printf("Starting to Stream %s file to CloudWatch Logs", logfile)
@@ -220,55 +248,66 @@ func streamLogTextToCloudWatch(dbName, logfile, seqToken string,
 		return err
 	}
 	logLines := strings.Split(strings.TrimSpace(*output.LogFileData), "\n")
-	logEvents := make([]*cloudwatchlogs.InputLogEvent, 0, len(logLines))
-
-	for _, line := range logLines {
-		logLine := strings.Split(line, "UTC")
-		if len(logLine) == 2 {
-			logTime := logLine[0]
-			eventTime, _ := time.Parse(logTimeStampFormat, logTime+" UTC")
-			inputLogEvent := &cloudwatchlogs.InputLogEvent{
-				Message:   aws.String(line),
-				Timestamp: aws.Int64(eventTime.UnixNano() / int64(time.Millisecond)),
-			}
-			logEvents = append(logEvents, inputLogEvent)
-		}
+	logLineChunks, err := logLineChunker(logLines)
+	if err != nil {
+		log.Printf("Error occurred while chunking the db log file")
+		return err
 	}
 
-	if len(logEvents) >= 1 {
-		cloudWatchEvents := &cloudwatchlogs.PutLogEventsInput{
-			LogGroupName:  aws.String(logGroupName),
-			LogStreamName: aws.String(dbName),
-			LogEvents:     logEvents,
+	for index, chunk := range logLineChunks {
+		log.Printf("Number of lines in chunk %d is %d", index+1, len(chunk))
+		logEvents := make([]*cloudwatchlogs.InputLogEvent, 0, len(chunk))
+		seqToken := initSeqToken
+		if _, ok := dbNextToken[dbName]; ok {
+			seqToken = dbNextToken[dbName]
 		}
-		if seqToken != initSeqToken {
-			log.Println("Starting with an valid seq token", seqToken)
-			cloudWatchEvents = &cloudwatchlogs.PutLogEventsInput{
+		for _, line := range chunk {
+			logLine := strings.Split(line, "UTC")
+			if len(logLine) == 2 {
+				logTime := logLine[0]
+				eventTime, _ := time.Parse(logTimeStampFormat, logTime+" UTC")
+				inputLogEvent := &cloudwatchlogs.InputLogEvent{
+					Message:   aws.String(line),
+					Timestamp: aws.Int64(eventTime.UnixNano() / int64(time.Millisecond)),
+				}
+				logEvents = append(logEvents, inputLogEvent)
+			}
+		}
+
+		if len(logEvents) >= 1 {
+			cloudWatchEvents := &cloudwatchlogs.PutLogEventsInput{
 				LogGroupName:  aws.String(logGroupName),
 				LogStreamName: aws.String(dbName),
-				SequenceToken: aws.String(seqToken),
 				LogEvents:     logEvents,
 			}
-		} else {
-			log.Println("Starting with an empty seq token", seqToken)
-		}
-	NextLogLine:
-		resp, err := cloudWatchSvc.PutLogEvents(cloudWatchEvents)
-		if err != nil {
-			log.Printf("The PutLogEvents failed with %v", err)
-			if aerr, ok := err.(awserr.Error); ok && aerr.Code() == "ThrottlingException" {
-				// backoff
-				time.Sleep(2 * time.Second)
-				goto NextLogLine
+			if seqToken != initSeqToken {
+				log.Println("Starting with an valid seq token", seqToken)
+				cloudWatchEvents = &cloudwatchlogs.PutLogEventsInput{
+					LogGroupName:  aws.String(logGroupName),
+					LogStreamName: aws.String(dbName),
+					SequenceToken: aws.String(seqToken),
+					LogEvents:     logEvents,
+				}
+			} else {
+				log.Println("Starting with an initial seq token 'START'", seqToken)
 			}
-			return err
+		PutLogEvents:
+			resp, err := cloudWatchSvc.PutLogEvents(cloudWatchEvents)
+			if err != nil {
+				log.Printf("The PutLogEvents failed with %v", err)
+				if aerr, ok := err.(awserr.Error); ok && aerr.Code() == "ThrottlingException" {
+					// Constant backoff
+					time.Sleep(2 * time.Second)
+					goto PutLogEvents
+				}
+				return err
+			}
+			log.Println("The PutLogEvents succeeded with next sequence token", *resp.NextSequenceToken)
+			if resp.RejectedLogEventsInfo != nil {
+				log.Printf("%s events were rejected", *resp.RejectedLogEventsInfo)
+			}
+			dbNextToken[dbName] = *resp.NextSequenceToken
 		}
-		log.Println("The PutLogEvents succeeded with next sequence token", *resp.NextSequenceToken)
-		if resp.RejectedLogEventsInfo != nil {
-			log.Printf("%s events were rejected", *resp.RejectedLogEventsInfo)
-		}
-		dbNextToken[dbName] = *resp.NextSequenceToken
-		return nil
 	}
 	log.Printf("No data exists in %s or the file has been completely streamed", logfile)
 	return nil
@@ -318,15 +357,11 @@ Download:
 	// Write the log lines to the cloudwatch log group
 	log.Printf("The sequence token for db %s is %s", dbName, dbNextToken[dbName])
 Streamer:
-	if nextToken, ok := dbNextToken[dbName]; ok {
-		err = streamLogTextToCloudWatch(dbName, logfile, nextToken, res)
-	} else {
-		err = streamLogTextToCloudWatch(dbName, logfile, "-1", res)
-	}
+	err = streamLogTextToCloudWatch(dbName, logfile, res)
 	if err != nil {
 		log.Println("Streaming to CloudWatch Error", err)
 		if aerr, ok := err.(awserr.Error); ok && aerr.Code() == "ThrottlingException" {
-			// backoff
+			// Constant backoff
 			time.Sleep(2 * time.Second)
 			goto Streamer
 		}
